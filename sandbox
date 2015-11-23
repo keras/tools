@@ -1,0 +1,37 @@
+#!/bin/bash
+
+container_name=sandbox
+image_name=sandbox
+
+docker images | grep $image_name || docker build -t $image_name - <<EOT
+FROM debian:testing
+
+# add mint repo (for firefox)
+RUN apt-key adv --keyserver keys.gnupg.net --recv-keys 3EE67F3D0FF405B2
+RUN echo "deb http://packages.linuxmint.com debian import" >> /etc/apt/sources.list.d/mint.list
+
+RUN apt-get update
+RUN apt-get install -y dialog bash-completion vim sudo less
+
+RUN useradd -m sandbox
+RUN gpasswd -a sandbox sudo
+RUN echo sandbox ALL= NOPASSWD: ALL > /etc/sudoers.d/sandbox
+
+USER sandbox
+ENV USER=sandbox
+WORKDIR /home/sandbox
+
+RUN echo 'alias apt-get="sudo apt-get"' >> /home/sandbox/.bashrc
+
+CMD bash -l
+EOT
+
+docker ps -a | grep -q $container_name > /dev/null
+created=$?
+
+if [[ $created == 0 ]]
+then
+  docker start -a -i $container_name
+else
+  docker run -i -t -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix --name=$container_name $image_name
+fi
