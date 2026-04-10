@@ -1,0 +1,1115 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = [
+#     "pytest",
+#     "pyyaml",
+# ]
+# ///
+
+"""dsb — Run commands in an isolated Docker container.
+
+Features:
+  - Builds a shared Docker image (debian:bookworm-slim + mise)
+    on first use; subsequent launches reuse the cached image. Pass --rebuild to
+    force a rebuild.
+  - Uses a named Docker volume (dsb-home) as the container user's home,
+    keeping all tool state (.cargo/, .rustup/, .local/share/mise/, etc.)
+    in the Docker VM's filesystem — isolated from the host and fast.
+  - Overlays every entry found in ~/.config/dsb/home/ as individual bind
+    mounts on top of the home volume, so user config (.claude/, .gitconfig,
+    .config/mise/, etc.) flows in from the host without polluting it with
+    tool state. Override the volume name with DSB_HOME_VOLUME.
+  - Mirrors the host working directory path suffix under /workdir so file paths
+    stay consistent (e.g. ~/work/myproject -> /workdir/work/myproject).
+  - Runs as the host user with libnss-wrapper uid mapping to the
+    "sandbox" username, avoiding permission mismatches on mounted volumes.
+  - By default, launches inside a tmux session so the terminal can be
+    detached/reattached. Pass --no-tmux to run CMD directly.
+
+Command routing (arguments after dsb options are passed as Docker CMD):
+  dsb                     -> bash
+  dsb -- foo              -> foo           (no leading "-" replaces command)
+
+Options:
+  --project <path>   host directory to mount as project (default: CWD)
+  --no-project       ephemeral workdir, no host directory mounted
+  --rebuild          force a full Docker image rebuild and recreate volumes
+  --reset-home       remove and recreate the home volume (wipes all tool state)
+  --[no-]tmux        run inside a tmux session (default: --tmux)
+  --[no-]tty         allocate a TTY (default: --tty)
+
+Environment:
+  DSB_ENV           space-separated list of env var names to forward
+                    into the container (e.g. "DATABRICKS_TOKEN GITHUB_TOKEN")
+
+X11 / GUI:
+  DISPLAY is forwarded automatically. On macOS, set up XQuartz once:
+    1. Install XQuartz, open it, go to Preferences → Security →
+       enable "Allow connections from network clients"
+    2. Run: xhost + localhost
+"""
+
+# development notes:
+# run ruff to check formatting and linting:
+#   uv run --with ruff ruff check ./dsb
+# run pytest to execute tests:
+#   uv run ./dsb test
+
+
+from __future__ import annotations
+
+import argparse
+import io
+import os
+import shlex
+import subprocess
+import sys
+import tarfile
+import textwrap
+import types
+
+import yaml
+import pytest
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+CONTAINER_HOME = "/home/sandbox"
+
+
+@dataclass
+class Config:
+    """Parsed CLI options and derived paths."""
+
+    cwd: Path
+    home: Path
+    project: Path | None = None  # None = ephemeral, no project mount
+    rebuild: bool = False
+    reset_home: bool = False
+    verbose: bool = False
+    use_mise: bool = True
+    use_tmux: bool = True
+    use_tty: bool = True
+    passthrough_args: list[str] = field(default_factory=list)
+
+    @property
+    def image_name(self) -> str:
+        return os.environ.get("DSB_IMAGE", "dsb:latest")
+
+    @property
+    def workdir(self) -> str:
+        """Container working directory — /workdir/… for projects, $HOME for ephemeral."""
+        if self.project is None:
+            return "/workdir"
+        try:
+            rel = self.project.relative_to(self.home)
+            return f"/workdir/{rel}"
+        except ValueError:
+            parts = self.project.parts
+            return f"/workdir/{'/'.join(parts[-2:])}"
+
+    @property
+    def dsb_home(self) -> Path:
+        """Dedicated container home directory on the host."""
+        return self.home / ".config" / "dsb" / "home"
+
+    @property
+    def home_volume(self) -> str:
+        return os.environ.get("DSB_HOME_VOLUME", "dsb-home")
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: list[str]) -> Config:
+    """Parse CLI arguments, passing remainder through to Docker CMD."""
+    file_cfg = _load_dsb_config(Path.home())
+
+    parser = argparse.ArgumentParser(
+        prog="dsb",
+        description="Run Claude Code in an isolated Docker container.",
+    )
+    project_group = parser.add_mutually_exclusive_group()
+    project_group.add_argument(
+        "--project",
+        default=None,
+        metavar="PATH",
+        help="host directory to mount as the project (default: CWD)",
+    )
+    project_group.add_argument(
+        "--no-project",
+        action="store_true",
+        help="ephemeral workdir, no host directory mounted",
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="force a full Docker image rebuild and recreate volumes",
+    )
+    parser.add_argument(
+        "--reset-home",
+        action="store_true",
+        help="remove and recreate the home volume (wipes all tool state)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="print the docker run command before executing",
+    )
+    parser.add_argument(
+        "--mise",
+        action=argparse.BooleanOptionalAction,
+        default=file_cfg.get("mise", True),
+        help="run mise install on startup (default: true)",
+    )
+    parser.add_argument(
+        "--tmux",
+        action=argparse.BooleanOptionalAction,
+        default=file_cfg.get("tmux", False),
+        help="run inside tmux (default: true)",
+    )
+    parser.add_argument(
+        "--tty",
+        action=argparse.BooleanOptionalAction,
+        default=file_cfg.get("tty", False),
+        help="allocate a TTY (default: true)",
+    )
+    parser.add_argument(
+        "rest",
+        nargs=argparse.REMAINDER,
+        help="arguments passed to Docker CMD (use -- to separate)",
+    )
+
+    ns = parser.parse_args(argv)
+
+    # REMAINDER captures the '--' separator if present; strip it
+    passthrough = ns.rest
+    if passthrough and passthrough[0] == "--":
+        passthrough = passthrough[1:]
+
+    if ns.no_project:
+        project = None
+    elif ns.project:
+        project = Path(ns.project).resolve()
+    else:
+        project = Path.cwd()
+
+    return Config(
+        cwd=Path.cwd(),
+        home=Path.home(),
+        project=project,
+        rebuild=ns.rebuild,
+        reset_home=ns.reset_home,
+        verbose=ns.verbose,
+        use_mise=ns.mise,
+        use_tmux=ns.tmux,
+        use_tty=ns.tty,
+        passthrough_args=passthrough,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dockerfile
+# ---------------------------------------------------------------------------
+
+DOCKERFILE = r"""
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    git curl gpg \
+    tmux zsh gosu libnss-wrapper bash-completion nano \
+    podman fuse-overlayfs uidmap \
+    build-essential pkg-config libssl-dev \
+    libx11-6 libxext6 libxrender1 libxtst6 libxi6 libxcursor1 libx11-xcb1 libxkbcommon-x11-0 \
+    sudo \
+    && rm -rf /var/lib/apt/lists/* \
+    && echo "sandbox ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/sandbox \
+    && chmod 0440 /etc/sudoers.d/sandbox
+
+# Rootless Podman configuration
+RUN mkdir -p /etc/containers && \
+    echo '{"default":[{"type":"insecureAcceptAnything"}]}' \
+        > /etc/containers/policy.json && \
+    printf '[registries.search]\nregistries = ["docker.io"]\n' \
+        > /etc/containers/registries.conf && \
+    printf '[storage]\ndriver = "overlay"\n\n[storage.options]\nmount_program = "/usr/bin/fuse-overlayfs"\n' \
+        > /etc/containers/storage.conf && \
+    printf '[containers]\n# Docker bind-mounts /proc/sys read-only so crun cannot set sysctls.\ndefault_sysctls = []\n# Sharing the outer PID namespace avoids crun needing to mount a new proc\n# inside a nested user+mount namespace, which Docker prevents.\npidns = "host"\n# slirp4netns sets accept_dad before the inner mount namespace is active,\n# hitting the outer read-only /proc/sys; disabling IPv6 skips that sysctl.\nnetwork_cmd_options = ["enable_ipv6=false"]\n' \
+        > /etc/containers/containers.conf
+
+# Shell setup
+RUN printf '\n[ -f /usr/share/bash-completion/bash_completion ] && . /usr/share/bash-completion/bash_completion\n' \
+    >> /etc/bash.bashrc && \
+    printf '\neval "$(mise activate bash)"\n' >> /etc/bash.bashrc && \
+    printf '\nalias docker=podman\n' >> /etc/bash.bashrc
+# profile.d so login shells (bash -lc / su) also get the mise shims in PATH.
+# /etc/profile hardcodes a minimal PATH that drops Docker ENV, so this is needed.
+RUN printf 'export HOME=/home/sandbox\nexport MISE_DATA_DIR=/home/sandbox/.local/share/mise\nexport MISE_STATE_DIR=/home/sandbox/.local/state/mise\nexport MISE_CACHE_DIR=/home/sandbox/.cache/mise\nexport PATH=/home/sandbox/.local/share/mise/shims:$PATH\n' \
+    > /etc/profile.d/mise.sh
+
+# mise
+RUN curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh
+
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV EDITOR=nano
+
+RUN mkdir -p /home/sandbox /workdir && chmod 777 /home/sandbox /workdir
+
+ENV HOME=/home/sandbox
+ENV MISE_DATA_DIR=/home/sandbox/.local/share/mise
+ENV PATH=/home/sandbox/.local/share/mise/shims:$PATH
+
+# Entrypoint
+RUN cat > /entrypoint.sh <<'ENTRYPOINT'
+#!/bin/bash
+
+_verbose_run() {
+    t0=${EPOCHREALTIME/./}
+    "$@"
+    rc=$?
+    if [ -n "${DSB_VERBOSE}" ]; then
+        dt=$(( ${EPOCHREALTIME/./} - t0 ))
+        printf '[dsb][%s]: %d.%03ds\n' "$*" "$((dt / 1000000))" "$(( (dt % 1000000) / 1000 ))" >&2
+    fi
+    return $rc
+}
+
+HOST_UID="${HOST_UID:-0}"
+HOST_GID="${HOST_GID:-0}"
+cp /etc/passwd /tmp/passwd
+echo "sandbox:x:${HOST_UID}:${HOST_GID}::/home/sandbox:/bin/bash" >> /tmp/passwd
+echo "sandbox:x:${HOST_UID}:${HOST_GID}::/home/sandbox:/bin/bash" >> /etc/passwd
+# PAM account validation requires a shadow entry; ! = locked password (fine for NOPASSWD sudo)
+echo "sandbox:!:19000:0:99999:7:::" >> /etc/shadow
+export NSS_WRAPPER_PASSWD=/tmp/passwd
+export NSS_WRAPPER_GROUP=/etc/group
+export LD_PRELOAD=$(find /usr/lib -name 'libnss_wrapper.so' | head -1)
+# Promote root mount to shared propagation so Podman can propagate mounts
+# across its own mount namespaces (Docker defaults to private propagation).
+mount --make-rshared /
+# subuid/subgid ranges required by rootless Podman for uid mapping
+echo "sandbox:100000:65536" >> /etc/subuid
+echo "sandbox:100000:65536" >> /etc/subgid
+# XDG_RUNTIME_DIR is required by rootless Podman for its socket
+export XDG_RUNTIME_DIR="/run/user/${HOST_UID}"
+mkdir -p "${XDG_RUNTIME_DIR}"
+chmod 700 "${XDG_RUNTIME_DIR}"
+chown "${HOST_UID}:${HOST_GID}" "${XDG_RUNTIME_DIR}"
+# Fix ownership of home dir
+export HOME=/home/sandbox
+export MISE_DATA_DIR=/home/sandbox/.local/share/mise
+export MISE_STATE_DIR=/home/sandbox/.local/state/mise
+export MISE_CACHE_DIR=/home/sandbox/.cache/mise
+export PATH="/home/sandbox/.local/share/mise/shims:/home/sandbox/bin:$PATH"
+export MISE_YES=1
+
+# Make /proc/sys writable so nested container runtimes (podman, etc.) can
+# configure network namespaces they create. Requires SYS_ADMIN + seccomp=unconfined.
+mount -o remount,rw /proc/sys 2>/dev/null || true
+
+if [ -n "${DSB_MISE}" ]; then
+    _verbose_run gosu "${HOST_UID}:${HOST_GID}" mise install || true
+fi
+exec gosu "${HOST_UID}:${HOST_GID}" "$@"
+ENTRYPOINT
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]
+""".lstrip()
+
+
+# ---------------------------------------------------------------------------
+# Docker build
+# ---------------------------------------------------------------------------
+
+
+def _build_context_tar() -> bytes:
+    """Create an in-memory tar archive with just the Dockerfile.
+
+    Mise tools are installed lazily at container
+    start and cached via a named Docker volume.
+    """
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        dockerfile_bytes = DOCKERFILE.encode()
+        info = tarfile.TarInfo("Dockerfile")
+        info.size = len(dockerfile_bytes)
+        tar.addfile(info, io.BytesIO(dockerfile_bytes))
+    return buf.getvalue()
+
+
+def image_exists(name: str) -> bool:
+    return (
+        subprocess.run(
+            ["docker", "image", "inspect", name],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def build_image(cfg: Config) -> None:
+    print(f"Building {cfg.image_name}...")
+    context = _build_context_tar()
+    run_kwargs = {}
+    if not cfg.verbose:
+        run_kwargs["stdout"] = subprocess.DEVNULL
+        run_kwargs["stderr"] = subprocess.DEVNULL
+    subprocess.run(
+        ["docker", "build", "-t", cfg.image_name, "-"],
+        input=context,
+        check=True,
+        **run_kwargs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# First-run config initialisation
+# ---------------------------------------------------------------------------
+
+# Relative paths (from ~/.config/dsb) → default file contents.
+DSB_DEFAULT_FILES: dict[str, str] = {
+    "config.yaml": textwrap.dedent(
+        """\
+        # dsb configuration — uncomment and edit as needed.
+        # See: dsb --help
+        #
+        # Run inside a tmux session (lets you detach/reattach):
+        # tmux: true
+        #
+        # Allocate a TTY:
+        # tty: true
+        #
+        # Extra bind mounts (~ expands to host home on left, container home on right):
+        # mount:
+        #   - ~/.ssh:~/.ssh
+        """
+    ),
+    "home/.config/mise/conf.d/tools.toml": textwrap.dedent(
+        """\
+        # mise tools — list tools you want available in every dsb container.
+        # See: https://mise.jdx.dev/configuration.html
+        #
+        # [tools]
+        # node = "lts"
+        # python = "latest"
+        # rust = "latest"
+        # uv = "latest"
+        """
+    ),
+}
+
+
+def _init_config_dir(home: Path) -> None:
+    """Create ~/.config/dsb with default template files if it does not exist."""
+    config_dir = home / ".config" / "dsb"
+    if config_dir.exists():
+        return
+
+    print(f"Initialising default config at {config_dir} …")
+
+    for rel, content in DSB_DEFAULT_FILES.items():
+        path = config_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+
+# ---------------------------------------------------------------------------
+# Volume mounts
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Mount:
+    """A single Docker bind mount."""
+
+    src: str
+    dst: str
+    readonly: bool = True
+
+    def to_args(self) -> list[str]:
+        spec = f"{self.src}:{self.dst}"
+        if self.readonly:
+            spec += ":ro"
+        return ["-v", spec]
+
+
+def _load_dsb_config(home: Path) -> dict:
+    """Load ~/.config/dsb/config.yaml; return empty dict if absent or empty."""
+    path = home / ".config" / "dsb" / "config.yaml"
+    if not path.exists():
+        return {}
+    with path.open() as f:
+        return yaml.safe_load(f) or {}
+
+
+def resolve_mounts(cfg: Config) -> list[Mount]:
+    """Build the list of bind mounts for the container."""
+    mounts: list[Mount] = []
+
+    # Project directory (--no-project skips this)
+    if cfg.project is not None:
+        mounts.append(Mount(str(cfg.project), cfg.workdir, readonly=False))
+
+    # Overlay each entry from dsb_home on top of the named home volume.
+    # Config (.claude/, .gitconfig, .config/mise/, …) flows in from the host;
+    # tool state (.cargo/, .rustup/, .local/) stays in the named volume.
+    if cfg.dsb_home.is_dir():
+        for entry in sorted(cfg.dsb_home.iterdir()):
+            mounts.append(
+                Mount(str(entry), f"{CONTAINER_HOME}/{entry.name}", readonly=False)
+            )
+
+    # Explicit mounts from ~/.config/dsb/config.yaml
+    # Format:  mount: ["~/src:~/dst"]  — ~ in src expands to host home,
+    #                                      ~ in dst expands to container home.
+    dsb_cfg = _load_dsb_config(cfg.home)
+    for entry in dsb_cfg.get("mount", []):
+        src_str, dst_str = entry.split(":", 1)
+        src = Path(src_str.strip()).expanduser()
+        dst = dst_str.strip()
+        if dst.startswith("~/"):
+            dst = f"{CONTAINER_HOME}/{dst[2:]}"
+        elif dst == "~":
+            dst = CONTAINER_HOME
+        mounts.append(Mount(str(src), dst, readonly=False))
+
+    return mounts
+
+
+# ---------------------------------------------------------------------------
+# Environment forwarding
+# ---------------------------------------------------------------------------
+
+
+def resolve_env(cfg: Config) -> list[tuple[str, str]]:
+    """Collect environment variables to pass into the container."""
+    env: list[tuple[str, str]] = [
+        ("HOST_UID", str(os.getuid())),
+        ("HOST_GID", str(os.getgid())),
+        ("HOME", CONTAINER_HOME),
+        ("SHELL", "/bin/bash"),
+        ("TERM", os.environ.get("TERM", "xterm-256color")),
+        ("COLORTERM", os.environ.get("COLORTERM", "")),
+    ]
+
+    # X11 forwarding: on macOS, Docker Desktop runs in a VM so the host X11
+    # socket isn't reachable. Always point at the host via TCP so XQuartz
+    # works after: xhost + localhost  (run once in XQuartz terminal)
+    host_display = os.environ.get("DISPLAY", "")
+    if sys.platform == "darwin" or not host_display or host_display.startswith("/"):
+        display = "host.docker.internal:0"
+    else:
+        display = host_display
+    env.append(("DISPLAY", display))
+
+    if cfg.use_mise:
+        env.append(("DSB_MISE", "1"))
+    if cfg.verbose:
+        env.append(("DSB_VERBOSE", "1"))
+
+    # Forward user-specified env vars (DSB_ENV)
+    for name in os.environ.get("DSB_ENV", "").split():
+        if name in os.environ:
+            env.append((name, os.environ[name]))
+
+    return env
+
+
+# ---------------------------------------------------------------------------
+# Docker run
+# ---------------------------------------------------------------------------
+
+
+def _resolve_container_cmd(cfg: Config) -> list[str]:
+    """Determine the command the container should run.
+
+    Applies the same routing as the old entrypoint:
+      - No args          -> bash
+      - Otherwise        -> passthrough as-is
+
+    When tmux is enabled, wraps the cmd in a tmux session.
+    """
+    args = cfg.passthrough_args
+
+    if not args:
+        inner = ["bash"]
+    else:
+        inner = args
+
+    if cfg.use_tmux:
+        post_command = "exec bash" if inner[0] not in ("bash", "zsh") else ""
+        quoted = " ".join(shlex.quote(a) for a in inner)
+        return ["tmux", "new-session", "-s", "main", f"{quoted}; {post_command}"]
+
+    return inner
+
+
+def build_run_command(
+    cfg: Config, mounts: list[Mount], env: list[tuple[str, str]]
+) -> list[str]:
+    """Assemble the full 'docker run' command."""
+    cmd: list[str] = ["docker", "run", "-i"]
+    if cfg.use_tty:
+        cmd.append("-t")
+    cmd.append("--rm")
+    # Required for rootless Podman inside the container:
+    #   /dev/fuse          — fuse-overlayfs storage driver
+    #   /dev/net/tun       — slirp4netns user-mode network helper
+    #   seccomp=unconfined — allows clone(CLONE_NEWUSER) and related syscalls
+    #   apparmor=unconfined — Docker's AppArmor profile blocks mount(2) even
+    #                         with SYS_ADMIN; crun needs to mount proc inside
+    #                         the inner container's mount namespace
+    #   SYS_ADMIN          — lets setuid newuidmap write to /proc/<pid>/uid_map
+    #                         in the parent user namespace (CAP_SETUID alone is
+    #                         not sufficient when nested inside Docker)
+    #   NET_ADMIN          — allows writing to /proc/sys/net/* in network
+    #                         namespaces that podman creates for inner containers
+    cmd.extend(
+        [
+            "--device",
+            "/dev/fuse",
+            "--device",
+            "/dev/net/tun",
+            "--security-opt",
+            "seccomp=unconfined",
+            "--security-opt",
+            "apparmor=unconfined",
+            "--cap-add",
+            "SYS_ADMIN",
+            "--cap-add",
+            "NET_ADMIN",
+        ]
+    )
+
+    # Named volume as home base — tool state (.cargo, .rustup, .local, …)
+    # stays in the Docker VM, off the host filesystem.
+    cmd.extend(["-v", f"{cfg.home_volume}:{CONTAINER_HOME}"])
+
+    for mount in mounts:
+        cmd.extend(mount.to_args())
+
+    cmd.extend(["-w", cfg.workdir])
+
+    for key, val in env:
+        cmd.extend(["-e", f"{key}={val}"])
+
+    cmd.append(cfg.image_name)
+
+    cmd.extend(_resolve_container_cmd(cfg))
+    return cmd
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main(args) -> None:
+    _init_config_dir(Path.home())
+    cfg = parse_args(args)
+
+    if cfg.reset_home:
+        print(f"Removing home volume {cfg.home_volume}...")
+        subprocess.run(
+            ["docker", "volume", "rm", "-f", cfg.home_volume],
+            check=False,
+            capture_output=True,
+        )
+
+    if cfg.rebuild or not image_exists(cfg.image_name):
+        build_image(cfg)
+
+    mounts = resolve_mounts(cfg)
+    env = resolve_env(cfg)
+    cmd = build_run_command(cfg, mounts, env)
+
+    if cfg.verbose:
+        import shlex
+
+        print(shlex.join(cmd), file=sys.stderr)
+
+    os.execvp(cmd[0], cmd)
+
+
+class TestParseArgs:
+    def test_all_flags(self):
+        args = [
+            "--rebuild",
+            "--no-tmux",
+            "-v",
+            "--",
+            "echo",
+            "hello",
+        ]
+        cfg = parse_args(args)
+        assert cfg.rebuild is True
+        assert cfg.use_tmux is False
+        assert cfg.verbose is True
+        assert cfg.passthrough_args == ["echo", "hello"]
+
+    def test_config_yaml_sets_tmux_tty_defaults(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        config_dir = home / ".config" / "dsb"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.yaml").write_text("tmux: false\ntty: false\n")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        monkeypatch.setattr(Path, "cwd", staticmethod(lambda: home))
+
+        cfg = parse_args([])
+        assert cfg.use_tmux is False
+        assert cfg.use_tty is False
+
+    def test_cli_flag_overrides_config_yaml(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        config_dir = home / ".config" / "dsb"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.yaml").write_text("tmux: false\ntty: false\n")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+        monkeypatch.setattr(Path, "cwd", staticmethod(lambda: home))
+
+        cfg = parse_args(["--tmux", "--tty"])
+        assert cfg.use_tmux is True
+        assert cfg.use_tty is True
+
+
+@pytest.fixture
+def sandbox(tmp_path, monkeypatch):
+    """Set up a fake home + project directory tree and patch away side effects."""
+    home = tmp_path / "home"
+    project = home / "dev" / "myproject"
+    project.mkdir(parents=True)
+
+    # Dedicated container home
+    dsb_home = home / ".config" / "dsb" / "home"
+    dsb_home.mkdir(parents=True)
+
+    monkeypatch.setattr(Path, "cwd", staticmethod(lambda: project))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr("os.getuid", lambda: 1000)
+    monkeypatch.setattr("os.getgid", lambda: 1000)
+
+    # Capture the docker command instead of exec-ing
+    captured = {}
+
+    def fake_execvp(file, args):
+        captured["cmd"] = args
+
+    monkeypatch.setattr("os.execvp", fake_execvp)
+
+    # Skip actual Docker interactions
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **kw: type("R", (), {"returncode": 0})(),  # image exists
+    )
+
+    return types.SimpleNamespace(
+        home=home, project=project, dsb_home=dsb_home, captured=captured
+    )
+
+
+class TestMainIntegration:
+    """Full integration tests that call main() against a temp directory."""
+
+    def test_home_volume_mounted(self, sandbox):
+        main(["--no-tmux", "--no-tty"])
+
+        cmd = " ".join(sandbox.captured["cmd"])
+        assert f"dsb-home:{CONTAINER_HOME}" in cmd
+
+    def test_dsb_home_entries_overlaid_individually(self, sandbox):
+        (sandbox.dsb_home / ".gitconfig").write_text("[user]\n  name = Test\n")
+        (sandbox.dsb_home / ".claude").mkdir()
+
+        main(["--no-tmux", "--no-tty"])
+
+        cmd = " ".join(sandbox.captured["cmd"])
+        assert f"{sandbox.dsb_home}/.gitconfig:{CONTAINER_HOME}/.gitconfig" in cmd
+        assert f"{sandbox.dsb_home}/.claude:{CONTAINER_HOME}/.claude" in cmd
+
+    def test_project_dir_mounted(self, sandbox):
+        main(["--no-tmux", "--no-tty"])
+
+        cmd = " ".join(sandbox.captured["cmd"])
+        assert f"{sandbox.project}:/workdir/dev/myproject" in cmd
+
+    def test_passthrough_args_appended(self, sandbox):
+        main(["--no-tmux", "--no-tty", "--", "bash", "-c", "echo hi"])
+
+        cmd = sandbox.captured["cmd"]
+        assert cmd[-3:] == ["bash", "-c", "echo hi"]
+
+    def test_shared_image_name(self, sandbox):
+        main(["--no-tmux", "--no-tty"])
+
+        cmd = sandbox.captured["cmd"]
+        assert "dsb:latest" in cmd
+
+    def test_env_vars_forwarded(self, sandbox, monkeypatch):
+        monkeypatch.setenv("DSB_ENV", "MY_TOKEN")
+        monkeypatch.setenv("MY_TOKEN", "secret123")
+
+        main(["--no-tmux", "--no-tty"])
+
+        cmd = sandbox.captured["cmd"]
+        assert "MY_TOKEN=secret123" in cmd
+
+    def test_no_project_no_workdir_mount(self, sandbox):
+        main(["--no-tmux", "--no-tty", "--no-project"])
+
+        cmd = " ".join(sandbox.captured["cmd"])
+        assert "/workdir/" not in cmd
+        assert "-w /workdir" in cmd
+
+    def test_project_flag_overrides_cwd(self, sandbox):
+        other = sandbox.home / "dev" / "other-repo"
+        other.mkdir(parents=True)
+
+        main(["--no-tmux", "--no-tty", "--project", str(other)])
+
+        cmd = " ".join(sandbox.captured["cmd"])
+        assert f"{other}:/workdir/dev/other-repo" in cmd
+
+    def test_rebuild_triggers_docker_build(self, sandbox, monkeypatch):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return type("R", (), {"returncode": 0, "stderr": b""})()
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        main(["--rebuild", "--no-tmux", "--no-tty"])
+
+        builds = [c for c in calls if c[1] == "build"]
+        assert len(builds) == 1
+        assert builds[0][1] == "build"
+
+    def test_reset_home_removes_volume(self, sandbox, monkeypatch):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return type("R", (), {"returncode": 0, "stderr": b""})()
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        main(["--reset-home", "--no-tmux", "--no-tty"])
+
+        rm_calls = [c for c in calls if c[:3] == ["docker", "volume", "rm"]]
+        assert len(rm_calls) == 1
+        assert "dsb-home" in rm_calls[0]
+
+
+class TestResolveMounts:
+    """Unit tests for mount resolution."""
+
+    def _cfg(self, tmp_path):
+        home = tmp_path / "home"
+        cwd = home / "dev" / "myproject"
+        cwd.mkdir(parents=True)
+        dsb_home = home / ".config" / "dsb" / "home"
+        dsb_home.mkdir(parents=True)
+        return Config(cwd=cwd, home=home, project=cwd), dsb_home
+
+    def test_dsb_home_entries_mounted_individually(self, tmp_path):
+        cfg, dsb_home = self._cfg(tmp_path)
+        (dsb_home / ".gitconfig").touch()
+        (dsb_home / ".claude").mkdir()
+
+        mounts = resolve_mounts(cfg)
+        dsts = [m.dst for m in mounts]
+        assert f"{CONTAINER_HOME}/.gitconfig" in dsts
+        assert f"{CONTAINER_HOME}/.claude" in dsts
+
+    def test_dsb_home_not_mounted_as_whole(self, tmp_path):
+        cfg, _ = self._cfg(tmp_path)
+        mounts = resolve_mounts(cfg)
+        assert not any(m.dst == CONTAINER_HOME for m in mounts)
+
+    def test_empty_dsb_home_no_overlay_mounts(self, tmp_path):
+        cfg, _ = self._cfg(tmp_path)
+        mounts = resolve_mounts(cfg)
+        overlay = [m for m in mounts if m.dst.startswith(CONTAINER_HOME)]
+        assert len(overlay) == 0
+
+    def test_no_project_skips_workdir_mount(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir(parents=True)
+        dsb_home = home / ".config" / "dsb" / "home"
+        dsb_home.mkdir(parents=True)
+        cfg = Config(cwd=home, home=home, project=None)
+        mounts = resolve_mounts(cfg)
+        workdir_mounts = [m for m in mounts if m.dst.startswith("/workdir/")]
+        assert len(workdir_mounts) == 0
+
+    def test_project_mount_present(self, tmp_path):
+        cfg, _ = self._cfg(tmp_path)
+        mounts = resolve_mounts(cfg)
+        project_mounts = [m for m in mounts if m.dst == cfg.workdir]
+        assert len(project_mounts) == 1
+        assert project_mounts[0].src == str(cfg.project)
+        assert project_mounts[0].readonly is False
+
+    def test_config_yaml_mount_tilde_dst(self, tmp_path):
+        cfg, _ = self._cfg(tmp_path)
+        # Use absolute src so we don't depend on ~ resolving to cfg.home (a tmp path)
+        gitconfig = Path.home() / ".gitconfig"
+        config_yaml = cfg.home / ".config" / "dsb" / "config.yaml"
+        config_yaml.write_text("mount:\n  - ~/.gitconfig:~/.gitconfig\n")
+
+        mounts = resolve_mounts(cfg)
+        explicit = [m for m in mounts if m.dst == f"{CONTAINER_HOME}/.gitconfig"]
+        assert len(explicit) == 1
+        assert explicit[0].src == str(gitconfig)
+        assert explicit[0].readonly is False
+
+    def test_config_yaml_mount_absolute_dst(self, tmp_path):
+        cfg, _ = self._cfg(tmp_path)
+        src = cfg.home / ".ssh"
+        src.mkdir()
+        config_yaml = cfg.home / ".config" / "dsb" / "config.yaml"
+        config_yaml.write_text(f"mount:\n  - {src}:/home/sandbox/.ssh\n")
+
+        mounts = resolve_mounts(cfg)
+        explicit = [m for m in mounts if m.dst == "/home/sandbox/.ssh"]
+        assert len(explicit) == 1
+        assert explicit[0].src == str(src)
+
+    def test_config_yaml_missing_no_extra_mounts(self, tmp_path):
+        cfg, _ = self._cfg(tmp_path)
+        before = resolve_mounts(cfg)
+        # ensure no config.yaml exists
+        assert not (cfg.home / ".config" / "dsb" / "config.yaml").exists()
+        assert before == resolve_mounts(cfg)
+
+    def test_config_yaml_empty_mount_list(self, tmp_path):
+        cfg, _ = self._cfg(tmp_path)
+        config_yaml = cfg.home / ".config" / "dsb" / "config.yaml"
+        config_yaml.write_text("mount: []\n")
+        mounts = resolve_mounts(cfg)
+        explicit = [m for m in mounts if m.dst.startswith(CONTAINER_HOME + "/")]
+        assert len(explicit) == 0
+
+
+class TestInitConfigDir:
+    def test_creates_config_dir_when_absent(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        _init_config_dir(home)
+        assert (home / ".config" / "dsb").is_dir()
+
+    def test_creates_all_default_files(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        _init_config_dir(home)
+        config_dir = home / ".config" / "dsb"
+        for rel in DSB_DEFAULT_FILES:
+            assert (config_dir / rel).exists(), f"missing: {rel}"
+
+    def test_config_yaml_is_all_comments(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        _init_config_dir(home)
+        text = (home / ".config" / "dsb" / "config.yaml").read_text()
+        non_comment = [
+            line for line in text.splitlines() if line and not line.startswith("#")
+        ]
+        assert non_comment == [], f"unexpected non-comment lines: {non_comment}"
+
+    def test_mise_tools_toml_is_all_comments(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        _init_config_dir(home)
+        text = (
+            home
+            / ".config"
+            / "dsb"
+            / "home"
+            / ".config"
+            / "mise"
+            / "conf.d"
+            / "tools.toml"
+        ).read_text()
+        non_comment = [
+            line for line in text.splitlines() if line and not line.startswith("#")
+        ]
+        assert non_comment == [], f"unexpected non-comment lines: {non_comment}"
+
+    def test_does_not_overwrite_existing_config_dir(self, tmp_path):
+        home = tmp_path / "home"
+        config_dir = home / ".config" / "dsb"
+        config_dir.mkdir(parents=True)
+        sentinel = config_dir / "config.yaml"
+        sentinel.write_text("tmux: true\n")
+        _init_config_dir(home)
+        assert sentinel.read_text() == "tmux: true\n"
+
+
+# ---------------------------------------------------------------------------
+# Docker integration tests — build and run the real container via the script.
+# Slow (~60s first run for image build, ~2s per test after).
+# Run with:  dsb --test -m docker -v
+# Skip with: dsb --test -m 'not docker'
+# ---------------------------------------------------------------------------
+
+try:
+    _docker_available = (
+        subprocess.run(["docker", "info"], capture_output=True).returncode == 0
+    )
+except FileNotFoundError:
+    _docker_available = False
+
+docker = pytest.mark.skipif(not _docker_available, reason="Docker not available")
+
+SCRIPT = str(Path(__file__).resolve())
+
+
+@pytest.fixture(scope="class")
+def docker_env(tmp_path_factory):
+    """Persistent test project with mise.toml — shared across all tests in a class.
+
+    Pre-builds the Docker image so individual tests only run containers.
+    """
+    root = tmp_path_factory.mktemp("dockertest")
+    home = root / "home"
+    project = home / "dev" / "test-dsb"
+    project.mkdir(parents=True)
+
+    # Dedicated container home with tool config
+    dsb_home = home / ".config" / "dsb" / "home"
+    dsb_home.mkdir(parents=True)
+    (dsb_home / ".claude").mkdir()
+    (dsb_home / ".claude.json").touch()
+    mise_conf_d = dsb_home / ".config" / "mise" / "conf.d"
+    mise_conf_d.mkdir(parents=True)
+    (mise_conf_d / "tools.toml").write_text("[tools]\nuv = 'latest'\nrust = 'latest'\n")
+
+    # Always rebuild with a test-specific tag to avoid interfering with the real image
+    img = "dsb:test"
+    home_vol = "dsb-home-test"
+    context = _build_context_tar()
+    subprocess.run(
+        ["docker", "build", "-t", img, "-"],
+        input=context,
+        check=True,
+    )
+    subprocess.run(["docker", "volume", "create", home_vol], capture_output=True)
+
+    yield types.SimpleNamespace(
+        home=home, project=project, dsb_home=dsb_home, image=img, home_volume=home_vol
+    )
+
+    subprocess.run(["docker", "rmi", "-f", img], capture_output=True)
+    subprocess.run(["docker", "volume", "rm", "-f", home_vol], capture_output=True)
+
+
+@docker
+class TestDockerRuntime:
+    """Tests that call dsb.py as a subprocess, actually building
+    and running the Docker container. Validates entrypoint, profile.d, shim
+    resolution, and home mounting against the real mise runtime."""
+
+    def _run(self, docker_env, args, timeout=120):
+        """Run dsb.py as a subprocess in the test project dir."""
+        env = os.environ.copy()
+        env["HOME"] = str(docker_env.home)
+        env["DSB_IMAGE"] = docker_env.image
+        env["DSB_HOME_VOLUME"] = docker_env.home_volume
+        env.pop("DSB_ENV", None)
+        return subprocess.run(
+            [sys.executable, SCRIPT, "--no-tmux", "--no-tty", *args],
+            cwd=docker_env.project,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    def test_uv_available_in_login_shell(self, docker_env):
+        r = self._run(docker_env, ["--", "bash", "-lc", "uv --version"])
+        assert r.returncode == 0
+        assert "uv" in r.stdout
+
+    def test_uv_available_via_direct_invocation(self, docker_env):
+        r = self._run(docker_env, ["--", "uv", "--version"])
+        assert r.returncode == 0
+        assert "uv" in r.stdout
+
+    def test_home_correct_in_login_shell(self, docker_env):
+        r = self._run(docker_env, ["--", "bash", "-lc", "echo $HOME"])
+        assert r.returncode == 0
+        assert r.stdout.strip() == CONTAINER_HOME
+
+    def test_home_correct_via_entrypoint(self, docker_env):
+        r = self._run(docker_env, ["--", "bash", "-c", "echo $HOME"])
+        assert r.returncode == 0
+        assert r.stdout.strip() == CONTAINER_HOME
+
+    def test_mise_sees_home_config(self, docker_env):
+        r = self._run(docker_env, ["--", "bash", "-lc", "mise list 2>&1"])
+        assert r.returncode == 0
+        assert "uv" in r.stdout
+
+    def test_mise_shims_in_path(self, docker_env):
+        r = self._run(docker_env, ["--", "bash", "-lc", "echo $PATH"])
+        assert "mise/shims" in r.stdout
+
+    def test_no_permission_errors(self, docker_env):
+        r = self._run(docker_env, ["--", "uv", "--version"])
+        assert "Permission denied" not in r.stderr
+
+    def test_cargo_available_in_login_shell(self, docker_env):
+        r = self._run(docker_env, ["--", "bash", "-lc", "cargo --version"])
+        assert r.returncode == 0
+        assert "cargo" in r.stdout
+
+    def test_exit_code_propagation(self, docker_env):
+        """Non-zero exit code from the command should propagate through the container."""
+        r = self._run(docker_env, ["--", "bash", "-c", "exit 42"])
+        assert r.returncode == 42
+
+    def test_no_project_workdir_writable(self, docker_env):
+        """--no-project should land in a writable /workdir."""
+        r = self._run(
+            docker_env,
+            [
+                "--no-project",
+                "--",
+                "bash",
+                "-c",
+                "date > /workdir/test && cat /workdir/test",
+            ],
+        )
+        assert r.returncode == 0
+        assert r.stdout.strip() != ""
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--test"]:
+        import pytest
+
+        class _Module(pytest.Module):
+            def _getobj(self):
+                return sys.modules["__main__"]
+
+        class _CollectExtensionless:
+            def pytest_collect_file(self, parent, file_path):
+                if file_path.name == "dsb":
+                    return _Module.from_parent(parent, path=file_path)
+
+        sys.exit(
+            pytest.main([__file__, *sys.argv[2:]], plugins=[_CollectExtensionless()])
+        )
+    else:
+        main(sys.argv[1:])
